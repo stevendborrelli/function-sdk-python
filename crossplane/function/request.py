@@ -224,3 +224,27 @@ def get_required_schema(req: fnv1.RunFunctionRequest, name: str) -> dict | None:
         return None
 
     return resource.struct_to_dict(schema.openapi_v3)
+
+
+def get_dependencies(req: fnv1.RunFunctionRequest) -> list[fnv1.Dependency]:
+    """Get the ordering constraints accumulated so far in the pipeline.
+
+    Args:
+        req: The RunFunctionRequest containing dependencies.
+
+    Returns:
+        The dependencies returned by the functions that ran before this one.
+
+    A dependency declares that one composed resource must be created after,
+    and deleted before, another resource. It expresses ordering only - it
+    doesn't move any data between resources.
+
+    A function that has an opinion about ordering must return the full set it
+    wants going forward, including the edges it received here and still wants.
+    response.to copies them to the response for you, so most functions can
+    just add to them:
+
+        rsp = response.to(req)
+        response.add_dependency(rsp, "database", "network")
+    """
+    return list(req.dependencies.items)

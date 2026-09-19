@@ -407,6 +407,52 @@ class TestRequest(unittest.TestCase):
             got = request.get_required_schema(case.req, case.name)
             self.assertEqual(case.want, got, case.reason)
 
+    def test_get_dependencies(self) -> None:
+        @dataclasses.dataclass
+        class TestCase:
+            reason: str
+            req: fnv1.RunFunctionRequest
+            want: list[fnv1.Dependency]
+
+        cases = [
+            TestCase(
+                reason="No dependencies should return an empty list.",
+                req=fnv1.RunFunctionRequest(),
+                want=[],
+            ),
+            TestCase(
+                reason="Should return the dependencies accumulated so far.",
+                req=fnv1.RunFunctionRequest(
+                    dependencies=fnv1.Dependencies(
+                        items=[
+                            fnv1.Dependency(
+                                resource="database", composed_resource="network"
+                            ),
+                            fnv1.Dependency(
+                                resource="database",
+                                required_resource=fnv1.RequiredResourceDependency(
+                                    requirement_name="cluster"
+                                ),
+                            ),
+                        ]
+                    )
+                ),
+                want=[
+                    fnv1.Dependency(resource="database", composed_resource="network"),
+                    fnv1.Dependency(
+                        resource="database",
+                        required_resource=fnv1.RequiredResourceDependency(
+                            requirement_name="cluster"
+                        ),
+                    ),
+                ],
+            ),
+        ]
+
+        for case in cases:
+            got = request.get_dependencies(case.req)
+            self.assertEqual(case.want, got, case.reason)
+
 
 if __name__ == "__main__":
     unittest.main()
