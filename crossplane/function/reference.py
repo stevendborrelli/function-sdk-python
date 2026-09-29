@@ -671,35 +671,51 @@ class Scope:
         return v
 
     def _close(self) -> None:
-        _record(self.rsp, self.name, self._sources)
-
-        if not self._unresolved:
-            return
-
         exists = self.name in self.req.observed.resources
-        ordered = request.has_capability(self.req, fnv1.CAPABILITY_DEPENDENCIES)
 
-        if not exists:
-            # Crossplane won't create the resource until the dependency is
-            # ready. One that doesn't enforce dependencies would create it
-            # without the field, so hold it back by leaving it out instead.
-            if not ordered:
+        if self._unresolved:
+            if exists:
+                self._keep_current_spec()
+            elif not request.has_capability(self.req, fnv1.CAPABILITY_DEPENDENCIES):
+                # Crossplane won't create the resource until the dependency
+                # is ready. One that doesn't enforce dependencies would create
+                # it without the field, so hold it back by leaving it out.
                 self.rsp.desired.resources.pop(self.name, None)
-            return
 
-        # The resource exists, but something it refers to doesn't. The fields
-        # that refer to it came back None and were left out, and applying
-        # that would unset them. Keep what the resource already has for any
-        # field this function no longer sets, and say so.
+        # Declare dependencies only for a resource that's composed or exists.
+        # A scope that composed nothing has nothing to order, and Crossplane
+        # would ignore the dependencies, with an event saying so.
+        if self.name in self.rsp.desired.resources or exists:
+            _record(self.rsp, self.name, self._sources)
+
+    def _keep_current_spec(self) -> None:
+        """Keep an existing resource's spec while a reference it needs is gone.
+
+        The fields that refer to what's missing came back None and were left
+        out, and applying that would unset them. A function that didn't
+        compose the resource at all, because the value it needed wasn't
+        there, would have it deleted. Either way, keep what the resource
+        already has for anything this function doesn't set, and say so.
+        """
+        observed = resource.struct_to_dict(
+            self.req.observed.resources[self.name].resource
+        )
         if self.name in self.rsp.desired.resources:
             r = self.rsp.desired.resources[self.name]
-            observed = resource.struct_to_dict(
-                self.req.observed.resources[self.name].resource
-            )
             body = resource.struct_to_dict(r.resource)
             if "spec" in observed:
                 body["spec"] = _overlay(observed["spec"], body.get("spec", {}))
             r.resource.CopyFrom(resource.dict_to_struct(body))
+        else:
+            meta = observed.get("metadata", {})
+            body = {
+                "apiVersion": observed.get("apiVersion"),
+                "kind": observed.get("kind"),
+                "metadata": {k: meta[k] for k in ("name", "namespace") if k in meta},
+            }
+            if "spec" in observed:
+                body["spec"] = observed["spec"]
+            resource.update(self.rsp.desired.resources[self.name], body)
 
         response.warning(
             self.rsp,
@@ -761,7 +777,12 @@ def composing(
     left out. If the resource doesn't exist yet that's what ordering is for:
     Crossplane waits for the dependency before creating it. If it does exist,
     it keeps its current spec for the fields that were left out, and the
-    response carries a warning saying why.
+    response carries a warning saying why. That holds even if the block
+    doesn't compose the resource at all because the value it needed is
+    missing: an existing resource is kept rather than deleted.
+
+    Dependencies are declared only for a resource that's composed or already
+    exists. A block that composes nothing declares nothing.
     """
     scope = Scope(req, rsp, name)
     yield scope

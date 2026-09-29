@@ -581,6 +581,52 @@ class TestComposing(unittest.TestCase):
         self.assertEqual(rsp.results[0].severity, fnv1.SEVERITY_WARNING)
         self.assertIn("vpc.status.atProvider.id", rsp.results[0].message)
 
+    def test_composing_nothing_declares_nothing(self) -> None:
+        req = fnv1.RunFunctionRequest(meta=ORDERED)
+        rsp = response.to(req)
+        vpc = reference.named("vpc", VPC)
+
+        with reference.composing(req, rsp, "subnet") as c:
+            vpc_id = c.ref(vpc.status.atProvider.id)
+            if vpc_id:
+                desired_subnet(rsp, vpc_id)
+
+        self.assertNotIn("subnet", rsp.desired.resources)
+        self.assertEqual(edges(rsp), [])
+
+    def test_existing_resource_not_composed_is_kept(self) -> None:
+        subnet = {
+            "apiVersion": "ec2.aws.m.upbound.io/v1beta1",
+            "kind": "Subnet",
+            "metadata": {"name": "xr-subnet-1", "uid": "abc", "resourceVersion": "7"},
+            "spec": {"forProvider": {"region": "us-east-1", "vpcId": "vpc-0123"}},
+            "status": {"atProvider": {"id": "subnet-9"}},
+        }
+        req = fnv1.RunFunctionRequest(meta=ORDERED, observed=observed(subnet=subnet))
+        rsp = response.to(req)
+        vpc = reference.named("vpc", VPC)
+
+        with reference.composing(req, rsp, "subnet") as c:
+            vpc_id = c.ref(vpc.status.atProvider.id)
+            if vpc_id:
+                desired_subnet(rsp, vpc_id)
+
+        # Kept rather than deleted, as its spec, without what the API server
+        # owns: uid, resourceVersion and status.
+        self.assertEqual(
+            body(rsp, "subnet"),
+            {
+                "apiVersion": "ec2.aws.m.upbound.io/v1beta1",
+                "kind": "Subnet",
+                "metadata": {"name": "xr-subnet-1"},
+                "spec": {"forProvider": {"region": "us-east-1", "vpcId": "vpc-0123"}},
+            },
+        )
+        self.assertEqual(
+            edges(rsp), [{"resource": "subnet", "composed_resource": "vpc"}]
+        )
+        self.assertEqual(rsp.results[0].severity, fnv1.SEVERITY_WARNING)
+
     def test_without_capability_holds_back_by_omission(self) -> None:
         req = fnv1.RunFunctionRequest(meta=UNORDERED)
         rsp = response.to(req)
@@ -628,6 +674,9 @@ class TestComposing(unittest.TestCase):
 
         with reference.composing(req, rsp, "app-config") as c:
             host = c.ref(db.status.address)
+            c.update(
+                {"apiVersion": "v1", "kind": "ConfigMap", "data": {"DB_HOST": host}}
+            )
 
         self.assertEqual(host, "db.a")
         self.assertEqual(
