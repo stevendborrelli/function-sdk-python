@@ -609,13 +609,26 @@ class Scope:
             state, and the dependency means Crossplane doesn't create this
             resource until the value exists.
 
+            A resource named with its model returns the value as the model
+            types it: a nested object comes back as its model, and a list of
+            them as a list of models, rather than as the JSON observed state
+            stores. Without a model the value is the JSON.
+
         Raises:
             TypeError: value isn't a field of a named resource.
-            ValueError: value is the whole resource rather than a field of it.
+            ValueError: value is the whole resource rather than a field of
+                it, or the observed value doesn't fit the model's type for it.
         """
         marker = _decode(ref(value))
         assert marker is not None  # noqa: S101  # ref always returns a marker.
-        return typing.cast(V, self._get(*marker, value._describe()))
+        v = self._get(*marker, value._describe())
+        if v is None or value._model is None:
+            return typing.cast(V, v)
+        try:
+            return typing.cast(V, pydantic.TypeAdapter(value._model).validate_python(v))
+        except pydantic.ValidationError as e:
+            msg = f"{value._describe()} doesn't match its model: {e}"
+            raise ValueError(msg) from e
 
     def external_name(self, named_resource: typing.Any) -> str | None:
         """Read a named resource's external name, and depend on that resource.

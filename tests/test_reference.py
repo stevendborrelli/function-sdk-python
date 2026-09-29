@@ -88,6 +88,8 @@ VPC_OBSERVED = {
     "status": {"atProvider": {"id": "vpc-0123", "arn": "arn:aws:ec2:vpc/vpc-0123"}},
 }
 
+POOL_OBSERVED = {"ranges": [{"from": "10.0.0.0"}, {"from": "10.1.0.0"}]}
+
 ORDERED = fnv1.RequestMeta(
     capabilities=[fnv1.CAPABILITY_CAPABILITIES, fnv1.CAPABILITY_DEPENDENCIES]
 )
@@ -513,6 +515,49 @@ class TestComposing(unittest.TestCase):
             edges(rsp), [{"resource": "subnet", "composed_resource": "vpc"}]
         )
         self.assertEqual(rsp.results, [])
+
+    def test_typed_values_come_back_as_models(self) -> None:
+        req = fnv1.RunFunctionRequest(
+            meta=ORDERED, observed=observed(pool=POOL_OBSERVED)
+        )
+        rsp = response.to(req)
+        pool = reference.named("pool", Pool)
+
+        with reference.composing(req, rsp, "subnet") as c:
+            ranges = c.ref(pool.ranges)
+            first = c.ref(pool.ranges[0])
+            start = c.ref(pool.ranges[0].from_)
+
+        self.assertEqual(
+            ranges, [Range(**{"from": "10.0.0.0"}), Range(**{"from": "10.1.0.0"})]
+        )
+        self.assertIsInstance(first, Range)
+        self.assertEqual(start, "10.0.0.0")
+
+    def test_untyped_values_come_back_as_json(self) -> None:
+        req = fnv1.RunFunctionRequest(
+            meta=ORDERED, observed=observed(pool=POOL_OBSERVED)
+        )
+        rsp = response.to(req)
+        pool = reference.named("pool")
+
+        with reference.composing(req, rsp, "subnet") as c:
+            ranges = c.ref(pool.ranges)
+
+        self.assertEqual(ranges, [{"from": "10.0.0.0"}, {"from": "10.1.0.0"}])
+
+    def test_values_that_dont_fit_the_model_fail(self) -> None:
+        req = fnv1.RunFunctionRequest(
+            meta=ORDERED, observed=observed(pool={"ranges": [{"from": 7}]})
+        )
+        rsp = response.to(req)
+        pool = reference.named("pool", Pool)
+
+        with (
+            self.assertRaisesRegex(ValueError, "pool.ranges doesn't match its model"),
+            reference.composing(req, rsp, "subnet") as c,
+        ):
+            c.ref(pool.ranges)
 
     def test_works_in_fields_that_are_not_strings(self) -> None:
         vpc_body = {"spec": {"forProvider": {"enableDnsSupport": True}}}
