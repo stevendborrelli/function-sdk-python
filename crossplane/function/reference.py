@@ -51,8 +51,31 @@ A reference is a marker string until resolve replaces it, because a string is
 what a model's own validation accepts in a string field. So references work
 only in string fields. Anywhere else the model rejects them, which is at
 least a loud failure rather than a silent one.
+
+There is a second way to use the same named resources. composing scopes the
+work to one composed resource, so a reference can resolve as soon as it's
+read rather than being marked for later:
+
+    vpc = reference.named("vpc", VPC)
+
+    with reference.composing(req, rsp, "subnet") as c:
+        c.update(
+            Subnet(
+                spec={
+                    "forProvider": {
+                        "region": "us-east-1",
+                        "vpcId": c.external_name(vpc),
+                    }
+                }
+            )
+        )
+
+c.external_name and c.ref return the value itself, or None while it isn't
+available, so they work in fields of any type and there is nothing to
+resolve afterwards. The dependencies are recorded when the block exits.
 """
 
+import contextlib
 import json
 import types
 import typing
@@ -362,6 +385,65 @@ def _value_at(obj: typing.Any, path: list) -> typing.Any:
     return obj
 
 
+def _lookup(req: fnv1.RunFunctionRequest, s: _Source) -> typing.Any:
+    """Return the resource a reference points at, or _MISSING."""
+    if s.kind == _COMPOSED:
+        if s.name not in req.observed.resources:
+            return _MISSING
+        return resource.struct_to_dict(req.observed.resources[s.name].resource)
+
+    items = request.get_required_resources(req, s.name)
+    if s.resource_name is None:
+        # With several matches and nothing to pick by there is no right
+        # answer, so decline rather than guess.
+        return items[0] if len(items) == 1 else _MISSING
+    for item in items:
+        meta = item.get("metadata", {})
+        if meta.get("name") == s.resource_name and (
+            s.namespace is None or meta.get("namespace") == s.namespace
+        ):
+            return item
+    return _MISSING
+
+
+def _read(req: fnv1.RunFunctionRequest, s: _Source, path: list) -> typing.Any:
+    """Return the value a reference points at, or _MISSING if there isn't one."""
+    src = _lookup(req, s)
+    if src is _MISSING:
+        return _MISSING
+    if path == [_EXTERNAL_NAME]:
+        v = _value_at(src, ["metadata", "annotations", _EXTERNAL_NAME_ANNOTATION])
+        if v is _MISSING:
+            v = _value_at(src, ["metadata", "name"])
+    else:
+        v = _value_at(src, path)
+    return _MISSING if v is None else v
+
+
+def _record(
+    rsp: fnv1.RunFunctionResponse, name: str, sources: typing.Iterable[_Source]
+) -> None:
+    """Add a dependency of name on each source, skipping any already declared."""
+    declared = {
+        (d.resource, d.WhichOneof("depends_on"), _target(d))
+        for d in rsp.dependencies.items
+    }
+    for s in sorted(sources, key=lambda s: tuple(p or "" for p in s)):
+        if s.kind == _COMPOSED:
+            key = (name, "composed_resource", s.name)
+            if s.name == name or key in declared:
+                continue
+            response.add_dependency(rsp, name, s.name)
+        else:
+            key = (name, "required_resource", (s.name, s.resource_name, s.namespace))
+            if key in declared:
+                continue
+            response.add_required_resource_dependency(
+                rsp, name, s.name, name=s.resource_name, namespace=s.namespace
+            )
+        declared.add(key)
+
+
 class _Resolver:
     """Resolves the references in one desired composed resource."""
 
@@ -380,41 +462,13 @@ class _Resolver:
                 req.observed.resources[name].resource
             )
 
-    def source(self, s: _Source) -> typing.Any:
-        if s.kind == _COMPOSED:
-            if s.name not in self.req.observed.resources:
-                return _MISSING
-            return resource.struct_to_dict(self.req.observed.resources[s.name].resource)
-
-        items = request.get_required_resources(self.req, s.name)
-        if s.resource_name is None:
-            # With several matches and nothing to pick by there is no right
-            # answer, so decline rather than guess.
-            return items[0] if len(items) == 1 else _MISSING
-        for item in items:
-            meta = item.get("metadata", {})
-            if meta.get("name") == s.resource_name and (
-                s.namespace is None or meta.get("namespace") == s.namespace
-            ):
-                return item
-        return _MISSING
-
     def value(self, marker: tuple[_Source, list], at: list) -> typing.Any:
         s, path = marker
         self.sources.add(s)
 
-        src = self.source(s)
-        if src is not _MISSING:
-            if path == [_EXTERNAL_NAME]:
-                v = _value_at(
-                    src, ["metadata", "annotations", _EXTERNAL_NAME_ANNOTATION]
-                )
-                if v is _MISSING:
-                    v = _value_at(src, ["metadata", "name"])
-            else:
-                v = _value_at(src, path)
-            if v is not _MISSING and v is not None:
-                return v
+        v = _read(self.req, s, path)
+        if v is not _MISSING:
+            return v
 
         kept = _value_at(self.observed, at)
         if kept is not _MISSING:
@@ -463,10 +517,6 @@ def resolve(req: fnv1.RunFunctionRequest, rsp: fnv1.RunFunctionResponse) -> None
     of desired state until it can.
     """
     ordered = request.has_capability(req, fnv1.CAPABILITY_DEPENDENCIES)
-    declared = {
-        (d.resource, d.WhichOneof("depends_on"), _target(d))
-        for d in rsp.dependencies.items
-    }
 
     for name in list(rsp.desired.resources):
         r = rsp.desired.resources[name]
@@ -481,22 +531,7 @@ def resolve(req: fnv1.RunFunctionRequest, rsp: fnv1.RunFunctionResponse) -> None
             continue
 
         r.resource.CopyFrom(resource.dict_to_struct(body))
-
-        for s in sorted(resolver.sources, key=lambda s: tuple(p or "" for p in s)):
-            if s.kind == _COMPOSED:
-                if s.name == name or (name, "composed_resource", s.name) in declared:
-                    continue
-                response.add_dependency(rsp, name, s.name)
-                declared.add((name, "composed_resource", s.name))
-                continue
-
-            key = (name, "required_resource", (s.name, s.resource_name, s.namespace))
-            if key in declared:
-                continue
-            response.add_required_resource_dependency(
-                rsp, name, s.name, name=s.resource_name, namespace=s.namespace
-            )
-            declared.add(key)
+        _record(rsp, name, resolver.sources)
 
 
 def _target(d: fnv1.Dependency) -> typing.Any:
@@ -539,3 +574,195 @@ def _contains_marker(s: structpb.Struct) -> bool:
         return False
 
     return any(walk(v) for v in s.fields.values())
+
+
+class Scope:
+    """Resolves references for one composed resource as they're read.
+
+    Get one from composing. Where ref and external_name at module level
+    return marker strings for resolve to replace later, a Scope's return the
+    value itself, because the scope already knows which resource is asking.
+    That means references work in fields of any type, not only strings, and
+    there's nothing left to resolve once the scope closes.
+    """
+
+    def __init__(
+        self, req: fnv1.RunFunctionRequest, rsp: fnv1.RunFunctionResponse, name: str
+    ):
+        """Create a Scope. Use composing rather than calling this directly."""
+        self.req = req
+        self.rsp = rsp
+        self.name = name
+        self._sources: set[_Source] = set()
+        self._unresolved: list[str] = []
+
+    def ref(self, value: V) -> V:
+        """Read a field of a named resource, and depend on that resource.
+
+        Args:
+            value: A field read through a stand-in from named or
+                named_required, for example vpc.status.atProvider.id.
+
+        Returns:
+            The field's observed value, or None if it isn't available yet.
+            None leaves the field out when the model is written to desired
+            state, and the dependency means Crossplane doesn't create this
+            resource until the value exists.
+
+        Raises:
+            TypeError: value isn't a field of a named resource.
+            ValueError: value is the whole resource rather than a field of it.
+        """
+        marker = _decode(ref(value))
+        assert marker is not None  # noqa: S101  # ref always returns a marker.
+        return typing.cast(V, self._get(*marker, value._describe()))
+
+    def external_name(self, named_resource: typing.Any) -> str | None:
+        """Read a named resource's external name, and depend on that resource.
+
+        Args:
+            named_resource: A stand-in from named or named_required.
+
+        Returns:
+            The external name, or None if the resource doesn't exist yet.
+
+        Raises:
+            TypeError: named_resource isn't a stand-in for a resource.
+        """
+        marker = _decode(external_name(named_resource))
+        assert marker is not None  # noqa: S101  # external_name always returns one.
+        return self._get(*marker, f"{named_resource._describe()} external name")
+
+    def update(self, source: dict | structpb.Struct | pydantic.BaseModel) -> None:
+        """Write this scope's composed resource to desired state.
+
+        Args:
+            source: The resource, as resource.update accepts it.
+
+        Unlike resource.update, this leaves out fields whose value is None. In
+        a scope, None is what ref returns for a value that isn't available
+        yet, and sending it would ask the API server to clear the field. Use
+        resource.update directly to send an explicit null.
+        """
+        r = self.rsp.desired.resources[self.name]
+        match source:
+            case pydantic.BaseModel():
+                data = source.model_dump(
+                    exclude_unset=True, exclude_none=True, by_alias=True, warnings=False
+                )
+                # As resource.update: identify the resource even though
+                # apiVersion and kind are rarely set explicitly.
+                data["apiVersion"] = source.apiVersion
+                data["kind"] = source.kind
+                resource.update(r, data)
+            case structpb.Struct():
+                resource.update(r, _without_none(resource.struct_to_dict(source)))
+            case dict():
+                resource.update(r, _without_none(source))
+            case _:
+                resource.update(r, source)
+
+    def _get(self, s: _Source, path: list, what: str) -> typing.Any:
+        self._sources.add(s)
+        v = _read(self.req, s, path)
+        if v is _MISSING:
+            self._unresolved.append(what)
+            return None
+        return v
+
+    def _close(self) -> None:
+        _record(self.rsp, self.name, self._sources)
+
+        if not self._unresolved:
+            return
+
+        exists = self.name in self.req.observed.resources
+        ordered = request.has_capability(self.req, fnv1.CAPABILITY_DEPENDENCIES)
+
+        if not exists:
+            # Crossplane won't create the resource until the dependency is
+            # ready. One that doesn't enforce dependencies would create it
+            # without the field, so hold it back by leaving it out instead.
+            if not ordered:
+                self.rsp.desired.resources.pop(self.name, None)
+            return
+
+        # The resource exists, but something it refers to doesn't. The fields
+        # that refer to it came back None and were left out, and applying
+        # that would unset them. Keep what the resource already has for any
+        # field this function no longer sets, and say so.
+        if self.name in self.rsp.desired.resources:
+            r = self.rsp.desired.resources[self.name]
+            observed = resource.struct_to_dict(
+                self.req.observed.resources[self.name].resource
+            )
+            body = resource.struct_to_dict(r.resource)
+            if "spec" in observed:
+                body["spec"] = _overlay(observed["spec"], body.get("spec", {}))
+            r.resource.CopyFrom(resource.dict_to_struct(body))
+
+        response.warning(
+            self.rsp,
+            f"{self.name}: kept its current spec, because "
+            f"{', '.join(self._unresolved)} isn't available",
+        )
+
+
+def _without_none(v: typing.Any) -> typing.Any:
+    """Return v with every None value left out, recursing into dicts and lists."""
+    if isinstance(v, dict):
+        return {k: _without_none(x) for k, x in v.items() if x is not None}
+    if isinstance(v, list):
+        return [_without_none(x) for x in v if x is not None]
+    return v
+
+
+def _overlay(base: dict, top: dict) -> dict:
+    """Return base with top written over it, recursing into nested dicts."""
+    out = dict(base)
+    for k, v in top.items():
+        out[k] = (
+            _overlay(out[k], v)
+            if isinstance(v, dict) and isinstance(out.get(k), dict)
+            else v
+        )
+    return out
+
+
+@contextlib.contextmanager
+def composing(
+    req: fnv1.RunFunctionRequest, rsp: fnv1.RunFunctionResponse, name: str
+) -> typing.Iterator[Scope]:
+    """Compose one resource, depending on whatever it reads from others.
+
+    Args:
+        req: The RunFunctionRequest, whose observed and required resources
+            references are read from.
+        rsp: The RunFunctionResponse to update.
+        name: The composed resource being built, a key into desired state.
+
+    Yields:
+        A Scope whose ref and external_name return real values, and record
+        that this resource depends on the resources they came from:
+
+            vpc = reference.named("vpc", VPC)
+
+            with reference.composing(req, rsp, "subnet") as c:
+                c.update(Subnet(spec={"forProvider": {
+                    "region": "us-east-1",
+                    "vpcId": c.external_name(vpc),
+                    "mapPublicIpOnLaunch": c.ref(vpc.spec.forProvider.enableDnsSupport),
+                }}))
+
+    The dependencies are recorded when the block exits, so an exception
+    inside it records nothing.
+
+    A value that isn't available yet comes back as None, and the field is
+    left out. If the resource doesn't exist yet that's what ordering is for:
+    Crossplane waits for the dependency before creating it. If it does exist,
+    it keeps its current spec for the fields that were left out, and the
+    response carries a warning saying why.
+    """
+    scope = Scope(req, rsp, name)
+    yield scope
+    scope._close()
