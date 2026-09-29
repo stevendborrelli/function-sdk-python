@@ -66,6 +66,13 @@ from crossplane.function.proto.v1 import run_function_pb2 as fnv1
 _EXTERNAL_NAME = "@externalName"
 _EXTERNAL_NAME_ANNOTATION = "crossplane.io/external-name"
 
+CONDITION_TYPE = "DependencyValuesAvailable"
+"""The XR condition composing reports whether any resource was kept.
+
+False while a resource was kept at its current spec because a value it's
+built from isn't available, naming each one. True otherwise.
+"""
+
 _COMPOSED = "composed"
 _REQUIRED = "required"
 
@@ -373,6 +380,7 @@ class Scope:
         self.name = name
         self._sources: set[_Source] = set()
         self._unresolved: list[str] = []
+        self._kept = False
 
     def ref(self, value: V) -> V:
         """Read a field of a named resource, and depend on that resource.
@@ -488,6 +496,8 @@ class Scope:
         if self.name in self.rsp.desired.resources or exists:
             _record(self.rsp, self.name, self._sources)
 
+        _report(self.rsp, self.name, self._unresolved if self._kept else [])
+
     def _keep_current_spec(self) -> None:
         """Keep an existing resource's spec while a reference it needs is gone.
 
@@ -495,7 +505,8 @@ class Scope:
         out, and applying that would unset them. A function that didn't
         compose the resource at all, because the value it needed wasn't
         there, would have it deleted. Either way, keep what the resource
-        already has for anything this function doesn't set, and say so.
+        already has for anything this function doesn't set, and say so in
+        the CONDITION_TYPE condition.
         """
         observed = resource.struct_to_dict(
             self.req.observed.resources[self.name].resource
@@ -517,11 +528,38 @@ class Scope:
                 body["spec"] = observed["spec"]
             resource.update(self.rsp.desired.resources[self.name], body)
 
-        response.warning(
-            self.rsp,
-            f"{self.name}: kept its current spec, because "
-            f"{', '.join(self._unresolved)} isn't available",
+        self._kept = True
+
+
+def _report(rsp: fnv1.RunFunctionResponse, name: str, missing: list[str]) -> None:
+    """Report on CONDITION_TYPE for one scope.
+
+    Every scope reports, so the condition is always returned: Crossplane
+    keeps a condition a function set earlier until the function sets it
+    again, so one returned only while something was kept would stay False
+    after it recovered. Scopes in one function share the condition, which
+    turns False on the first that kept its resource and names each.
+
+    The message is built from resource names and field paths only, so it
+    holds still while the situation does. Crossplane then leaves the
+    condition alone, where a result would be an event every reconcile.
+    """
+    c = next((c for c in rsp.conditions if c.type == CONDITION_TYPE), None)
+    if c is None:
+        c = rsp.conditions.add(
+            type=CONDITION_TYPE, status=fnv1.STATUS_CONDITION_TRUE, reason="Available"
         )
+
+    if not missing:
+        return
+
+    line = f"{name} kept its current spec: {', '.join(missing)} isn't available"
+    if c.status == fnv1.STATUS_CONDITION_TRUE:
+        c.status = fnv1.STATUS_CONDITION_FALSE
+        c.reason = "KeptCurrentSpec"
+        c.message = line
+    else:
+        c.message = f"{c.message}; {line}"
 
 
 def _without_none(v: typing.Any) -> typing.Any:
@@ -573,15 +611,15 @@ def composing(
     The dependencies are recorded when the block exits, so an exception
     inside it records nothing.
 
-    A value that isn't available yet comes back as None, and the field is
-    left out: when the block exits, None fields are removed from the resource
+    A value that isn't available yet comes back as None, and the field is left
+    out: when the block exits, None fields are removed from the resource
     however it was written, because sending one would clear the field. If the
     resource doesn't exist yet that's what ordering is for: Crossplane waits
-    for the dependency before creating it. If it does exist,
-    it keeps its current spec for the fields that were left out, and the
-    response carries a warning saying why. That holds even if the block
-    doesn't compose the resource at all because the value it needed is
-    missing: an existing resource is kept rather than deleted.
+    for the dependency before creating it. If it does exist, it keeps its
+    current spec for the fields that were left out, and the XR's
+    DependencyValuesAvailable condition turns False, saying why. That holds
+    even if the block doesn't compose the resource at all because the value it
+    needed is missing: an existing resource is kept rather than deleted.
 
     Dependencies are declared only for a resource that's composed or already
     exists. A block that composes nothing declares nothing.

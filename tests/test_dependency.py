@@ -110,6 +110,18 @@ def edges(rsp: fnv1.RunFunctionResponse) -> list[dict]:
     ]
 
 
+def conditions(rsp: fnv1.RunFunctionResponse) -> list[dict]:
+    return [
+        json_format.MessageToDict(c, preserving_proto_field_name=True)
+        for c in rsp.conditions
+    ]
+
+
+def kept(name: str) -> str:
+    """The condition message for a resource kept while the VPC's id is missing."""
+    return f"{name} kept its current spec: vpc.status.atProvider.id isn't available"
+
+
 def body(rsp: fnv1.RunFunctionResponse, name: str) -> dict:
     return resource.struct_to_dict(rsp.desired.resources[name].resource)
 
@@ -331,9 +343,67 @@ class TestComposing(unittest.TestCase):
             body(rsp, "subnet")["spec"]["forProvider"],
             {"region": "us-west-2", "vpcId": "vpc-0123"},
         )
-        self.assertEqual(len(rsp.results), 1)
-        self.assertEqual(rsp.results[0].severity, fnv1.SEVERITY_WARNING)
-        self.assertIn("vpc.status.atProvider.id", rsp.results[0].message)
+        self.assertEqual(rsp.results, [])
+        self.assertEqual(
+            conditions(rsp),
+            [
+                {
+                    "type": "DependencyValuesAvailable",
+                    "status": "STATUS_CONDITION_FALSE",
+                    "reason": "KeptCurrentSpec",
+                    "message": kept("subnet"),
+                }
+            ],
+        )
+
+    def test_condition_is_true_when_nothing_is_kept(self) -> None:
+        # Returned even so: Crossplane keeps a condition a function set
+        # earlier, so one only returned while False would never clear.
+        req = fnv1.RunFunctionRequest(meta=ORDERED)
+        rsp = response.to(req)
+        with dependency.composing(req, rsp, "subnet") as c:
+            c.ref(dependency.named("vpc", VPC).status.atProvider.id)
+
+        self.assertEqual(
+            conditions(rsp),
+            [
+                {
+                    "type": "DependencyValuesAvailable",
+                    "status": "STATUS_CONDITION_TRUE",
+                    "reason": "Available",
+                }
+            ],
+        )
+
+    def test_condition_names_every_kept_resource(self) -> None:
+        existing = {
+            "spec": {"forProvider": {"region": "us-east-1", "vpcId": "vpc-0123"}}
+        }
+        req = fnv1.RunFunctionRequest(
+            meta=ORDERED, observed=observed(a=existing, b=existing, c=VPC_OBSERVED)
+        )
+        rsp = response.to(req)
+        vpc = dependency.named("vpc", VPC)
+
+        # A kept resource, one that's fine, then another kept one: the one
+        # that's fine mustn't turn the condition back to True.
+        for name in ("a", "c", "b"):
+            with dependency.composing(req, rsp, name) as c:
+                if name == "c":
+                    continue
+                c.ref(vpc.status.atProvider.id)
+
+        self.assertEqual(
+            conditions(rsp),
+            [
+                {
+                    "type": "DependencyValuesAvailable",
+                    "status": "STATUS_CONDITION_FALSE",
+                    "reason": "KeptCurrentSpec",
+                    "message": f"{kept('a')}; {kept('b')}",
+                }
+            ],
+        )
 
     def test_composing_nothing_declares_nothing(self) -> None:
         req = fnv1.RunFunctionRequest(meta=ORDERED)
@@ -379,7 +449,7 @@ class TestComposing(unittest.TestCase):
         self.assertEqual(
             edges(rsp), [{"resource": "subnet", "composed_resource": "vpc"}]
         )
-        self.assertEqual(rsp.results[0].severity, fnv1.SEVERITY_WARNING)
+        self.assertEqual(conditions(rsp)[0]["reason"], "KeptCurrentSpec")
 
     def test_without_capability_holds_back_by_omission(self) -> None:
         req = fnv1.RunFunctionRequest(meta=UNORDERED)
