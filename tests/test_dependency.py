@@ -18,7 +18,7 @@ import unittest
 import pydantic
 from google.protobuf import json_format
 
-from crossplane.function import logging, reference, resource, response
+from crossplane.function import dependency, logging, resource, response
 from crossplane.function.proto.v1 import run_function_pb2 as fnv1
 
 # Models shaped the way datamodel-codegen generates them from CRDs: JSON names
@@ -119,14 +119,16 @@ class TestNamed(unittest.TestCase):
         logging.configure(level=logging.Level.DISABLED)
 
     def read(
-        self, observed_state: fnv1.State, fn: typing.Callable[[reference.Scope], object]
+        self,
+        observed_state: fnv1.State,
+        fn: typing.Callable[[dependency.Scope], object],
     ) -> object:
         req = fnv1.RunFunctionRequest(meta=ORDERED, observed=observed_state)
-        with reference.composing(req, response.to(req), "subnet") as c:
+        with dependency.composing(req, response.to(req), "subnet") as c:
             return fn(c)
 
     def test_follows_model_fields(self) -> None:
-        vpc = reference.named("vpc", VPC)
+        vpc = dependency.named("vpc", VPC)
         self.assertEqual(
             self.read(
                 observed(vpc=VPC_OBSERVED), lambda c: c.ref(vpc.status.atProvider.arn)
@@ -135,14 +137,14 @@ class TestNamed(unittest.TestCase):
         )
 
     def test_typo_fails_where_it_is_written(self) -> None:
-        vpc = reference.named("vpc", VPC)
+        vpc = dependency.named("vpc", VPC)
         with self.assertRaisesRegex(
             AttributeError, "vpc.status has no field 'atprovider'"
         ):
             _ = vpc.status.atprovider
 
     def test_keyword_field_is_read_by_its_json_name(self) -> None:
-        pool = reference.named("pool", Pool)
+        pool = dependency.named("pool", Pool)
         for field in (
             pool.ranges[0].from_,
             pool.ranges[0]["from"],
@@ -154,7 +156,7 @@ class TestNamed(unittest.TestCase):
             )
 
     def test_untyped_reads_what_it_is_given(self) -> None:
-        vpc = reference.named("vpc")
+        vpc = dependency.named("vpc")
         got = self.read(
             observed(vpc=VPC_OBSERVED),
             lambda c: c.ref(vpc.metadata.annotations["crossplane.io/external-name"]),
@@ -162,7 +164,7 @@ class TestNamed(unittest.TestCase):
         self.assertEqual(got, "vpc-0123")
 
     def test_has_no_value(self) -> None:
-        vpc = reference.named("vpc", VPC)
+        vpc = dependency.named("vpc", VPC)
         field = vpc.status.atProvider.id
         with self.assertRaisesRegex(TypeError, "has no value yet"):
             bool(field)
@@ -179,15 +181,15 @@ class TestNamed(unittest.TestCase):
 
     def test_ref_rejects_whole_resource(self) -> None:
         with self.assertRaisesRegex(ValueError, "external_name"):
-            self.read(fnv1.State(), lambda c: c.ref(reference.named("vpc", VPC)))
+            self.read(fnv1.State(), lambda c: c.ref(dependency.named("vpc", VPC)))
 
     def test_external_name_rejects_fields(self) -> None:
-        vpc = reference.named("vpc", VPC)
+        vpc = dependency.named("vpc", VPC)
         with self.assertRaises(TypeError):
             self.read(fnv1.State(), lambda c: c.external_name(vpc.status))
 
     def test_forgetting_ref_fails_validation(self) -> None:
-        vpc = reference.named("vpc", VPC)
+        vpc = dependency.named("vpc", VPC)
         with self.assertRaises(pydantic.ValidationError):
             SubnetForProvider(vpcId=vpc.status.atProvider.id)
 
@@ -209,9 +211,9 @@ class TestComposing(unittest.TestCase):
     def test_returns_values_and_records_edges(self) -> None:
         req = fnv1.RunFunctionRequest(meta=ORDERED, observed=observed(vpc=VPC_OBSERVED))
         rsp = response.to(req)
-        vpc = reference.named("vpc", VPC)
+        vpc = dependency.named("vpc", VPC)
 
-        with reference.composing(req, rsp, "subnet") as c:
+        with dependency.composing(req, rsp, "subnet") as c:
             vpc_id = c.ref(vpc.status.atProvider.id)
             name = c.external_name(vpc)
             desired_subnet(rsp, vpc_id)
@@ -228,9 +230,9 @@ class TestComposing(unittest.TestCase):
             meta=ORDERED, observed=observed(pool=POOL_OBSERVED)
         )
         rsp = response.to(req)
-        pool = reference.named("pool", Pool)
+        pool = dependency.named("pool", Pool)
 
-        with reference.composing(req, rsp, "subnet") as c:
+        with dependency.composing(req, rsp, "subnet") as c:
             ranges = c.ref(pool.ranges)
             first = c.ref(pool.ranges[0])
             start = c.ref(pool.ranges[0].from_)
@@ -246,9 +248,9 @@ class TestComposing(unittest.TestCase):
             meta=ORDERED, observed=observed(pool=POOL_OBSERVED)
         )
         rsp = response.to(req)
-        pool = reference.named("pool")
+        pool = dependency.named("pool")
 
-        with reference.composing(req, rsp, "subnet") as c:
+        with dependency.composing(req, rsp, "subnet") as c:
             ranges = c.ref(pool.ranges)
 
         self.assertEqual(ranges, [{"from": "10.0.0.0"}, {"from": "10.1.0.0"}])
@@ -258,11 +260,11 @@ class TestComposing(unittest.TestCase):
             meta=ORDERED, observed=observed(pool={"ranges": [{"from": 7}]})
         )
         rsp = response.to(req)
-        pool = reference.named("pool", Pool)
+        pool = dependency.named("pool", Pool)
 
         with (
             self.assertRaisesRegex(ValueError, "pool.ranges doesn't match its model"),
-            reference.composing(req, rsp, "subnet") as c,
+            dependency.composing(req, rsp, "subnet") as c,
         ):
             c.ref(pool.ranges)
 
@@ -270,9 +272,9 @@ class TestComposing(unittest.TestCase):
         vpc_body = {"spec": {"forProvider": {"enableDnsSupport": True}}}
         req = fnv1.RunFunctionRequest(meta=ORDERED, observed=observed(vpc=vpc_body))
         rsp = response.to(req)
-        vpc = reference.named("vpc")
+        vpc = dependency.named("vpc")
 
-        with reference.composing(req, rsp, "subnet") as c:
+        with dependency.composing(req, rsp, "subnet") as c:
             c.update(
                 Dns(
                     spec=DnsForProvider(
@@ -286,9 +288,9 @@ class TestComposing(unittest.TestCase):
     def test_missing_source_returns_none_and_keeps_edge(self) -> None:
         req = fnv1.RunFunctionRequest(meta=ORDERED)
         rsp = response.to(req)
-        vpc = reference.named("vpc", VPC)
+        vpc = dependency.named("vpc", VPC)
 
-        with reference.composing(req, rsp, "subnet") as c:
+        with dependency.composing(req, rsp, "subnet") as c:
             vpc_id = c.ref(vpc.status.atProvider.id)
             c.update(
                 Subnet(
@@ -311,9 +313,9 @@ class TestComposing(unittest.TestCase):
         subnet = {"spec": {"forProvider": {"region": "us-east-1", "vpcId": "vpc-0123"}}}
         req = fnv1.RunFunctionRequest(meta=ORDERED, observed=observed(subnet=subnet))
         rsp = response.to(req)
-        vpc = reference.named("vpc", VPC)
+        vpc = dependency.named("vpc", VPC)
 
-        with reference.composing(req, rsp, "subnet") as c:
+        with dependency.composing(req, rsp, "subnet") as c:
             c.update(
                 Subnet(
                     spec=SubnetSpec(
@@ -336,9 +338,9 @@ class TestComposing(unittest.TestCase):
     def test_composing_nothing_declares_nothing(self) -> None:
         req = fnv1.RunFunctionRequest(meta=ORDERED)
         rsp = response.to(req)
-        vpc = reference.named("vpc", VPC)
+        vpc = dependency.named("vpc", VPC)
 
-        with reference.composing(req, rsp, "subnet") as c:
+        with dependency.composing(req, rsp, "subnet") as c:
             vpc_id = c.ref(vpc.status.atProvider.id)
             if vpc_id:
                 desired_subnet(rsp, vpc_id)
@@ -356,9 +358,9 @@ class TestComposing(unittest.TestCase):
         }
         req = fnv1.RunFunctionRequest(meta=ORDERED, observed=observed(subnet=subnet))
         rsp = response.to(req)
-        vpc = reference.named("vpc", VPC)
+        vpc = dependency.named("vpc", VPC)
 
-        with reference.composing(req, rsp, "subnet") as c:
+        with dependency.composing(req, rsp, "subnet") as c:
             vpc_id = c.ref(vpc.status.atProvider.id)
             if vpc_id:
                 desired_subnet(rsp, vpc_id)
@@ -382,9 +384,9 @@ class TestComposing(unittest.TestCase):
     def test_without_capability_holds_back_by_omission(self) -> None:
         req = fnv1.RunFunctionRequest(meta=UNORDERED)
         rsp = response.to(req)
-        vpc = reference.named("vpc", VPC)
+        vpc = dependency.named("vpc", VPC)
 
-        with reference.composing(req, rsp, "subnet") as c:
+        with dependency.composing(req, rsp, "subnet") as c:
             desired_subnet(rsp, c.ref(vpc.status.atProvider.id))
 
         self.assertNotIn("subnet", rsp.desired.resources)
@@ -392,11 +394,11 @@ class TestComposing(unittest.TestCase):
     def test_exception_records_nothing(self) -> None:
         req = fnv1.RunFunctionRequest(meta=ORDERED, observed=observed(vpc=VPC_OBSERVED))
         rsp = response.to(req)
-        vpc = reference.named("vpc", VPC)
+        vpc = dependency.named("vpc", VPC)
 
         with (
             self.assertRaises(RuntimeError),
-            reference.composing(req, rsp, "subnet") as c,
+            dependency.composing(req, rsp, "subnet") as c,
         ):
             c.ref(vpc.status.atProvider.id)
             raise RuntimeError
@@ -422,9 +424,9 @@ class TestComposing(unittest.TestCase):
             },
         )
         rsp = response.to(req)
-        db = reference.named_required("dbs")
+        db = dependency.named_required("dbs")
 
-        with reference.composing(req, rsp, "app-config") as c:
+        with dependency.composing(req, rsp, "app-config") as c:
             host = c.ref(db.status.address)
             c.update(
                 {"apiVersion": "v1", "kind": "ConfigMap", "data": {"DB_HOST": host}}
@@ -443,23 +445,23 @@ class TestComposing(unittest.TestCase):
 
     def test_external_name(self) -> None:
         req = fnv1.RunFunctionRequest(meta=ORDERED, observed=observed(vpc=VPC_OBSERVED))
-        with reference.composing(req, response.to(req), "subnet") as c:
-            self.assertEqual(c.external_name(reference.named("vpc")), "vpc-0123")
+        with dependency.composing(req, response.to(req), "subnet") as c:
+            self.assertEqual(c.external_name(dependency.named("vpc")), "vpc-0123")
 
     def test_external_name_falls_back_to_name(self) -> None:
         req = fnv1.RunFunctionRequest(
             meta=ORDERED, observed=observed(vpc={"metadata": {"name": "xr-vpc-abc12"}})
         )
-        with reference.composing(req, response.to(req), "subnet") as c:
-            self.assertEqual(c.external_name(reference.named("vpc")), "xr-vpc-abc12")
+        with dependency.composing(req, response.to(req), "subnet") as c:
+            self.assertEqual(c.external_name(dependency.named("vpc")), "xr-vpc-abc12")
 
     def test_missing_field_on_existing_source_is_none(self) -> None:
         req = fnv1.RunFunctionRequest(
             meta=ORDERED, observed=observed(vpc={"metadata": {"name": "xr-vpc-abc12"}})
         )
         rsp = response.to(req)
-        with reference.composing(req, rsp, "subnet") as c:
-            vpc_id = c.ref(reference.named("vpc", VPC).status.atProvider.id)
+        with dependency.composing(req, rsp, "subnet") as c:
+            vpc_id = c.ref(dependency.named("vpc", VPC).status.atProvider.id)
             desired_subnet(rsp, vpc_id)
 
         self.assertIsNone(vpc_id)
@@ -468,12 +470,12 @@ class TestComposing(unittest.TestCase):
     def test_none_is_stripped_however_the_resource_is_written(self) -> None:
         req = fnv1.RunFunctionRequest(meta=ORDERED, observed=observed(vpc=VPC_OBSERVED))
         rsp = response.to(req)
-        vpc = reference.named("vpc", VPC)
-        gone = reference.named("gone", VPC)
+        vpc = dependency.named("vpc", VPC)
+        gone = dependency.named("gone", VPC)
 
         # resource.update rather than c.update, as a helper would call it. A
         # model field set to None is emitted as a null, because it was set.
-        with reference.composing(req, rsp, "subnet") as c:
+        with dependency.composing(req, rsp, "subnet") as c:
             resource.update(
                 rsp.desired.resources["subnet"],
                 Subnet(
@@ -486,7 +488,7 @@ class TestComposing(unittest.TestCase):
             )
 
         # A dict can carry None nested, and in a list.
-        with reference.composing(req, rsp, "tags") as c:
+        with dependency.composing(req, rsp, "tags") as c:
             resource.update(
                 rsp.desired.resources["tags"],
                 {
@@ -512,9 +514,9 @@ class TestComposing(unittest.TestCase):
         req = fnv1.RunFunctionRequest(meta=ORDERED, observed=observed(vpc=VPC_OBSERVED))
         rsp = response.to(req)
         response.add_dependency(rsp, "subnet", "vpc")
-        vpc = reference.named("vpc", VPC)
+        vpc = dependency.named("vpc", VPC)
 
-        with reference.composing(req, rsp, "subnet") as c:
+        with dependency.composing(req, rsp, "subnet") as c:
             c.update(
                 {
                     "a": c.ref(vpc.status.atProvider.id),
@@ -529,9 +531,9 @@ class TestComposing(unittest.TestCase):
     def test_self_reference_declares_nothing(self) -> None:
         req = fnv1.RunFunctionRequest(meta=ORDERED, observed=observed(vpc=VPC_OBSERVED))
         rsp = response.to(req)
-        vpc = reference.named("vpc", VPC)
+        vpc = dependency.named("vpc", VPC)
 
-        with reference.composing(req, rsp, "vpc") as c:
+        with dependency.composing(req, rsp, "vpc") as c:
             c.update({"tag": c.ref(vpc.status.atProvider.id)})
 
         self.assertEqual(edges(rsp), [])
@@ -561,9 +563,9 @@ class TestComposing(unittest.TestCase):
             },
         )
         rsp = response.to(req)
-        db = reference.named_required("dbs", name="a", namespace="y")
+        db = dependency.named_required("dbs", name="a", namespace="y")
 
-        with reference.composing(req, rsp, "app-config") as c:
+        with dependency.composing(req, rsp, "app-config") as c:
             host = c.ref(db.status.address)
             c.update(
                 {"apiVersion": "v1", "kind": "ConfigMap", "data": {"DB_HOST": host}}
@@ -580,15 +582,15 @@ class TestComposing(unittest.TestCase):
             {"metadata": {"name": "a"}, "status": {"address": "db.a"}},
             {"metadata": {"name": "b"}, "status": {"address": "db.b"}},
         )
-        with reference.composing(req, response.to(req), "app-config") as c:
-            self.assertIsNone(c.ref(reference.named_required("dbs").status.address))
+        with dependency.composing(req, response.to(req), "app-config") as c:
+            self.assertIsNone(c.ref(dependency.named_required("dbs").status.address))
 
     def test_rejects_values(self) -> None:
         req = fnv1.RunFunctionRequest(meta=ORDERED)
         rsp = response.to(req)
         with (
             self.assertRaises(TypeError),
-            reference.composing(req, rsp, "subnet") as c,
+            dependency.composing(req, rsp, "subnet") as c,
         ):
             c.ref("vpc-0123")
 

@@ -25,11 +25,11 @@ visible. The function says where a value comes from, the SDK records the
 dependency, and Crossplane waits rather than letting the provider discover
 the problem:
 
-    from crossplane.function import reference
+    from crossplane.function import dependency
 
-    vpc = reference.named("vpc", VPC)
+    vpc = dependency.named("vpc", VPC)
 
-    with reference.composing(req, rsp, "subnet") as c:
+    with dependency.composing(req, rsp, "subnet") as c:
         c.update(
             Subnet(
                 spec={
@@ -131,8 +131,8 @@ class _Field:
 
     def __bool__(self) -> bool:
         msg = (
-            f"{self._describe()} has no value yet. Wrap it in reference.ref() to "
-            "assign it; read the observed resource instead to branch on it."
+            f"{self._describe()} has no value yet. Read it with c.ref() inside "
+            "dependency.composing(), and branch on what that returns."
         )
         raise TypeError(msg)
 
@@ -141,7 +141,7 @@ class _Field:
         raise TypeError(msg)
 
     def __str__(self) -> str:
-        msg = f"{self._describe()} has no value yet. Wrap it in reference.ref()."
+        msg = f"{self._describe()} has no value yet. Read it with c.ref()."
         raise TypeError(msg)
 
     def __repr__(self) -> str:
@@ -220,8 +220,10 @@ def named(name: str, model: type[M] | None = None) -> typing.Any:
     Returns:
         A stand-in that reads like the resource itself:
 
-            vpc = reference.named("vpc", VPC)
-            "vpcId": reference.ref(vpc.status.atProvider.id),
+            vpc = dependency.named("vpc", VPC)
+
+            with dependency.composing(req, rsp, "subnet") as c:
+                vpc_id = c.ref(vpc.status.atProvider.id)
     """
     return _Field(_Source(_COMPOSED, name), (), model)
 
@@ -559,9 +561,9 @@ def composing(
         A Scope whose ref and external_name return real values, and record
         that this resource depends on the resources they came from:
 
-            vpc = reference.named("vpc", VPC)
+            vpc = dependency.named("vpc", VPC)
 
-            with reference.composing(req, rsp, "subnet") as c:
+            with dependency.composing(req, rsp, "subnet") as c:
                 c.update(Subnet(spec={"forProvider": {
                     "region": "us-east-1",
                     "vpcId": c.external_name(vpc),
