@@ -27,7 +27,6 @@ import crossplane.function.proto.v1.run_function_pb2 as fnv1
 import crossplane.function.proto.v1.run_function_pb2_grpc as grpcv1
 import crossplane.function.proto.v1beta1.run_function_pb2 as fnv1beta1
 import crossplane.function.proto.v1beta1.run_function_pb2_grpc as grpcv1beta1
-from crossplane.function import reference, response
 
 SERVICE_NAMES = (
     reflection.SERVICE_NAME,
@@ -108,10 +107,9 @@ def serve(
         lambda: asyncio.ensure_future(server.stop(grace=SHUTDOWN_GRACE_PERIOD_SECONDS)),
     )
 
-    guarded = ReferenceGuard(wrapped=function)
-    grpcv1.add_FunctionRunnerServiceServicer_to_server(guarded, server)
+    grpcv1.add_FunctionRunnerServiceServicer_to_server(function, server)
     grpcv1beta1.add_FunctionRunnerServiceServicer_to_server(
-        BetaFunctionRunner(wrapped=guarded), server
+        BetaFunctionRunner(wrapped=function), server
     )
     reflection.enable_server_reflection(SERVICE_NAMES, server)
 
@@ -137,36 +135,6 @@ def serve(
     finally:
         loop.run_until_complete(server.stop(grace=SHUTDOWN_GRACE_PERIOD_SECONDS))
         loop.close()
-
-
-class ReferenceGuard(grpcv1.FunctionRunnerServiceServicer):
-    """A ReferenceGuard fails a response that still contains references.
-
-    A reference from crossplane.function.reference is a marker string until
-    reference.resolve replaces it. A function that forgets to call resolve
-    would otherwise send the marker to the cluster as the field's value.
-    """
-
-    def __init__(self, wrapped: grpcv1.FunctionRunnerServiceServicer):
-        """Create a new ReferenceGuard."""
-        self.wrapped = wrapped
-
-    async def RunFunction(  # noqa: N802  # gRPC requires this name. # pyright: ignore[reportIncompatibleMethodOverride]
-        self, req: fnv1.RunFunctionRequest, context: grpc.aio.ServicerContext
-    ) -> fnv1.RunFunctionResponse:
-        """Run the underlying function, then check its desired state."""
-        rsp = await self.wrapped.RunFunction(req, context)
-
-        names = reference.unresolved(rsp)
-        if names:
-            response.fatal(
-                rsp,
-                f"desired composed resources {', '.join(sorted(names))} contain "
-                "unresolved references; call reference.resolve(req, rsp) "
-                "before returning",
-            )
-
-        return rsp
 
 
 class BetaFunctionRunner(grpcv1beta1.FunctionRunnerServiceServicer):

@@ -12,13 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import asyncio
+import typing
 import unittest
 
 import pydantic
 from google.protobuf import json_format
 
-from crossplane.function import logging, reference, resource, response, runtime
+from crossplane.function import logging, reference, resource, response
 from crossplane.function.proto.v1 import run_function_pb2 as fnv1
 
 # Models shaped the way datamodel-codegen generates them from CRDs: JSON names
@@ -115,11 +115,24 @@ def body(rsp: fnv1.RunFunctionResponse, name: str) -> dict:
 
 
 class TestNamed(unittest.TestCase):
+    def setUp(self) -> None:
+        logging.configure(level=logging.Level.DISABLED)
+
+    def read(
+        self, observed_state: fnv1.State, fn: typing.Callable[[reference.Scope], object]
+    ) -> object:
+        req = fnv1.RunFunctionRequest(meta=ORDERED, observed=observed_state)
+        with reference.composing(req, response.to(req), "subnet") as c:
+            return fn(c)
+
     def test_follows_model_fields(self) -> None:
         vpc = reference.named("vpc", VPC)
-        marker = reference.ref(vpc.status.atProvider.arn)
-        self.assertTrue(marker.startswith(reference.PREFIX))
-        self.assertIn('["status","atProvider","arn"]', marker)
+        self.assertEqual(
+            self.read(
+                observed(vpc=VPC_OBSERVED), lambda c: c.ref(vpc.status.atProvider.arn)
+            ),
+            "arn:aws:ec2:vpc/vpc-0123",
+        )
 
     def test_typo_fails_where_it_is_written(self) -> None:
         vpc = reference.named("vpc", VPC)
@@ -128,19 +141,25 @@ class TestNamed(unittest.TestCase):
         ):
             _ = vpc.status.atprovider
 
-    def test_keyword_field_is_recorded_under_its_json_name(self) -> None:
+    def test_keyword_field_is_read_by_its_json_name(self) -> None:
         pool = reference.named("pool", Pool)
-        for field in (pool.ranges[0].from_, pool.ranges[0]["from"]):
-            self.assertIn('["ranges",0,"from"]', reference.ref(field))
+        for field in (
+            pool.ranges[0].from_,
+            pool.ranges[0]["from"],
+            getattr(pool.ranges[0], "from"),
+        ):
+            self.assertEqual(
+                self.read(observed(pool=POOL_OBSERVED), lambda c, f=field: c.ref(f)),
+                "10.0.0.0",
+            )
 
-    def test_json_name_is_accepted_too(self) -> None:
-        pool = reference.named("pool", Pool)
-        self.assertIn('"from"', reference.ref(getattr(pool.ranges[0], "from")))
-
-    def test_untyped_records_what_it_is_given(self) -> None:
+    def test_untyped_reads_what_it_is_given(self) -> None:
         vpc = reference.named("vpc")
-        marker = reference.ref(vpc.metadata.annotations["crossplane.io/name"])
-        self.assertIn('["metadata","annotations","crossplane.io/name"]', marker)
+        got = self.read(
+            observed(vpc=VPC_OBSERVED),
+            lambda c: c.ref(vpc.metadata.annotations["crossplane.io/external-name"]),
+        )
+        self.assertEqual(got, "vpc-0123")
 
     def test_has_no_value(self) -> None:
         vpc = reference.named("vpc", VPC)
@@ -156,333 +175,21 @@ class TestNamed(unittest.TestCase):
 
     def test_ref_rejects_values(self) -> None:
         with self.assertRaisesRegex(TypeError, "expects a field"):
-            reference.ref("vpc-0123")
+            self.read(fnv1.State(), lambda c: c.ref("vpc-0123"))
 
     def test_ref_rejects_whole_resource(self) -> None:
         with self.assertRaisesRegex(ValueError, "external_name"):
-            reference.ref(reference.named("vpc", VPC))
+            self.read(fnv1.State(), lambda c: c.ref(reference.named("vpc", VPC)))
 
     def test_external_name_rejects_fields(self) -> None:
         vpc = reference.named("vpc", VPC)
         with self.assertRaises(TypeError):
-            reference.external_name(vpc.status)
-
-    def test_marker_survives_model_validation(self) -> None:
-        vpc = reference.named("vpc", VPC)
-        marker = reference.ref(vpc.status.atProvider.id)
-        subnet = SubnetForProvider(vpcId=marker)
-        self.assertEqual(subnet.vpcId, marker)
+            self.read(fnv1.State(), lambda c: c.external_name(vpc.status))
 
     def test_forgetting_ref_fails_validation(self) -> None:
         vpc = reference.named("vpc", VPC)
         with self.assertRaises(pydantic.ValidationError):
             SubnetForProvider(vpcId=vpc.status.atProvider.id)
-
-
-class TestResolve(unittest.TestCase):
-    def setUp(self) -> None:
-        logging.configure(level=logging.Level.DISABLED)
-
-    def test_substitutes_and_records_edge(self) -> None:
-        req = fnv1.RunFunctionRequest(meta=ORDERED, observed=observed(vpc=VPC_OBSERVED))
-        rsp = response.to(req)
-        vpc = reference.named("vpc", VPC)
-        desired_subnet(rsp, reference.ref(vpc.status.atProvider.id))
-
-        reference.resolve(req, rsp)
-
-        self.assertEqual(
-            body(rsp, "subnet")["spec"]["forProvider"]["vpcId"], "vpc-0123"
-        )
-        self.assertEqual(
-            edges(rsp), [{"resource": "subnet", "composed_resource": "vpc"}]
-        )
-
-    def test_external_name(self) -> None:
-        req = fnv1.RunFunctionRequest(meta=ORDERED, observed=observed(vpc=VPC_OBSERVED))
-        rsp = response.to(req)
-        desired_subnet(rsp, reference.external_name(reference.named("vpc")))
-
-        reference.resolve(req, rsp)
-
-        self.assertEqual(
-            body(rsp, "subnet")["spec"]["forProvider"]["vpcId"], "vpc-0123"
-        )
-
-    def test_external_name_falls_back_to_name(self) -> None:
-        vpc = {"metadata": {"name": "xr-vpc-abc12"}}
-        req = fnv1.RunFunctionRequest(meta=ORDERED, observed=observed(vpc=vpc))
-        rsp = response.to(req)
-        desired_subnet(rsp, reference.external_name(reference.named("vpc")))
-
-        reference.resolve(req, rsp)
-
-        self.assertEqual(
-            body(rsp, "subnet")["spec"]["forProvider"]["vpcId"], "xr-vpc-abc12"
-        )
-
-    def test_missing_source_drops_field_and_keeps_edge(self) -> None:
-        req = fnv1.RunFunctionRequest(meta=ORDERED)
-        rsp = response.to(req)
-        vpc = reference.named("vpc", VPC)
-        desired_subnet(rsp, reference.ref(vpc.status.atProvider.id))
-
-        reference.resolve(req, rsp)
-
-        self.assertEqual(
-            body(rsp, "subnet")["spec"]["forProvider"], {"region": "us-east-1"}
-        )
-        self.assertEqual(
-            edges(rsp), [{"resource": "subnet", "composed_resource": "vpc"}]
-        )
-
-    def test_missing_field_on_existing_source_drops_field(self) -> None:
-        vpc = {"metadata": {"name": "xr-vpc-abc12"}}  # No status yet.
-        req = fnv1.RunFunctionRequest(meta=ORDERED, observed=observed(vpc=vpc))
-        rsp = response.to(req)
-        desired_subnet(
-            rsp, reference.ref(reference.named("vpc", VPC).status.atProvider.id)
-        )
-
-        reference.resolve(req, rsp)
-
-        self.assertNotIn("vpcId", body(rsp, "subnet")["spec"]["forProvider"])
-
-    def test_existing_dependent_keeps_its_value(self) -> None:
-        subnet = {"spec": {"forProvider": {"region": "us-east-1", "vpcId": "vpc-0123"}}}
-        req = fnv1.RunFunctionRequest(meta=ORDERED, observed=observed(subnet=subnet))
-        rsp = response.to(req)
-        desired_subnet(
-            rsp, reference.ref(reference.named("vpc", VPC).status.atProvider.id)
-        )
-
-        reference.resolve(req, rsp)
-
-        self.assertEqual(
-            body(rsp, "subnet")["spec"]["forProvider"]["vpcId"], "vpc-0123"
-        )
-
-    def test_list_elements(self) -> None:
-        req = fnv1.RunFunctionRequest(meta=ORDERED, observed=observed(vpc=VPC_OBSERVED))
-        rsp = response.to(req)
-        vpc = reference.named("vpc", VPC)
-        gone = reference.named("gone", VPC)
-        resource.update(
-            rsp.desired.resources["subnet"],
-            {
-                "spec": {
-                    "forProvider": {
-                        "tags": [
-                            "static",
-                            reference.ref(vpc.status.atProvider.arn),
-                            reference.ref(gone.status.atProvider.arn),
-                        ]
-                    }
-                }
-            },
-        )
-
-        reference.resolve(req, rsp)
-
-        self.assertEqual(
-            body(rsp, "subnet")["spec"]["forProvider"]["tags"],
-            ["static", "arn:aws:ec2:vpc/vpc-0123"],
-        )
-        self.assertEqual(
-            edges(rsp),
-            [
-                {"resource": "subnet", "composed_resource": "gone"},
-                {"resource": "subnet", "composed_resource": "vpc"},
-            ],
-        )
-
-    def test_does_not_duplicate_declared_edges(self) -> None:
-        req = fnv1.RunFunctionRequest(meta=ORDERED, observed=observed(vpc=VPC_OBSERVED))
-        rsp = response.to(req)
-        response.add_dependency(rsp, "subnet", "vpc")
-        vpc = reference.named("vpc", VPC)
-        resource.update(
-            rsp.desired.resources["subnet"],
-            {
-                "a": reference.ref(vpc.status.atProvider.id),
-                "b": reference.ref(vpc.status.atProvider.arn),
-            },
-        )
-
-        reference.resolve(req, rsp)
-
-        self.assertEqual(
-            edges(rsp), [{"resource": "subnet", "composed_resource": "vpc"}]
-        )
-
-    def test_self_reference_records_no_edge(self) -> None:
-        req = fnv1.RunFunctionRequest(meta=ORDERED, observed=observed(vpc=VPC_OBSERVED))
-        rsp = response.to(req)
-        vpc = reference.named("vpc", VPC)
-        resource.update(
-            rsp.desired.resources["vpc"],
-            {"tag": reference.ref(vpc.status.atProvider.id)},
-        )
-
-        reference.resolve(req, rsp)
-
-        self.assertEqual(edges(rsp), [])
-
-    def test_without_capability_holds_back_by_omission(self) -> None:
-        req = fnv1.RunFunctionRequest(meta=UNORDERED)
-        rsp = response.to(req)
-        desired_subnet(
-            rsp, reference.ref(reference.named("vpc", VPC).status.atProvider.id)
-        )
-
-        reference.resolve(req, rsp)
-
-        self.assertNotIn("subnet", rsp.desired.resources)
-
-    def test_without_capability_resolved_resources_stay(self) -> None:
-        req = fnv1.RunFunctionRequest(
-            meta=UNORDERED, observed=observed(vpc=VPC_OBSERVED)
-        )
-        rsp = response.to(req)
-        desired_subnet(
-            rsp, reference.ref(reference.named("vpc", VPC).status.atProvider.id)
-        )
-
-        reference.resolve(req, rsp)
-
-        self.assertEqual(
-            body(rsp, "subnet")["spec"]["forProvider"]["vpcId"], "vpc-0123"
-        )
-
-    def test_leaves_resources_without_references_alone(self) -> None:
-        req = fnv1.RunFunctionRequest(meta=ORDERED)
-        rsp = response.to(req)
-        resource.update(rsp.desired.resources["plain"], {"spec": {"a": 1}})
-        before = rsp.SerializeToString()
-
-        reference.resolve(req, rsp)
-
-        self.assertEqual(rsp.SerializeToString(), before)
-
-
-class TestResolveRequired(unittest.TestCase):
-    def setUp(self) -> None:
-        logging.configure(level=logging.Level.DISABLED)
-
-    def req(self, *items: dict) -> fnv1.RunFunctionRequest:
-        return fnv1.RunFunctionRequest(
-            meta=ORDERED,
-            required_resources={
-                "dbs": fnv1.Resources(
-                    items=[
-                        fnv1.Resource(resource=resource.dict_to_struct(i))
-                        for i in items
-                    ]
-                )
-            },
-        )
-
-    def cm(self, rsp: fnv1.RunFunctionResponse, value: str) -> None:
-        resource.update(
-            rsp.desired.resources["app-config"], {"data": {"DB_HOST": value}}
-        )
-
-    def test_single_match(self) -> None:
-        req = self.req({"metadata": {"name": "a"}, "status": {"address": "db.a"}})
-        rsp = response.to(req)
-        self.cm(rsp, reference.ref(reference.named_required("dbs").status.address))
-
-        reference.resolve(req, rsp)
-
-        self.assertEqual(body(rsp, "app-config")["data"]["DB_HOST"], "db.a")
-        self.assertEqual(
-            edges(rsp),
-            [
-                {
-                    "resource": "app-config",
-                    "required_resource": {"requirement_name": "dbs"},
-                }
-            ],
-        )
-
-    def test_named_match(self) -> None:
-        req = self.req(
-            {
-                "metadata": {"name": "a", "namespace": "x"},
-                "status": {"address": "db.xa"},
-            },
-            {
-                "metadata": {"name": "a", "namespace": "y"},
-                "status": {"address": "db.ya"},
-            },
-        )
-        rsp = response.to(req)
-        db = reference.named_required("dbs", name="a", namespace="y")
-        self.cm(rsp, reference.ref(db.status.address))
-
-        reference.resolve(req, rsp)
-
-        self.assertEqual(body(rsp, "app-config")["data"]["DB_HOST"], "db.ya")
-        self.assertEqual(
-            edges(rsp)[0]["required_resource"],
-            {"requirement_name": "dbs", "name": "a", "namespace": "y"},
-        )
-
-    def test_declines_to_guess_between_matches(self) -> None:
-        req = self.req(
-            {"metadata": {"name": "a"}, "status": {"address": "db.a"}},
-            {"metadata": {"name": "b"}, "status": {"address": "db.b"}},
-        )
-        rsp = response.to(req)
-        self.cm(rsp, reference.ref(reference.named_required("dbs").status.address))
-
-        reference.resolve(req, rsp)
-
-        self.assertEqual(body(rsp, "app-config"), {"data": {}})
-
-
-class TestGuard(unittest.TestCase):
-    def setUp(self) -> None:
-        logging.configure(level=logging.Level.DISABLED)
-
-    def test_unresolved(self) -> None:
-        rsp = fnv1.RunFunctionResponse()
-        desired_subnet(
-            rsp, reference.ref(reference.named("vpc", VPC).status.atProvider.id)
-        )
-        resource.update(rsp.desired.resources["plain"], {"a": "b"})
-
-        self.assertEqual(reference.unresolved(rsp), ["subnet"])
-
-    def test_runtime_fails_a_forgotten_resolve(self) -> None:
-        class Forgetful:
-            async def RunFunction(self, req, _context):  # noqa: N802
-                rsp = response.to(req)
-                vpc = reference.named("vpc", VPC)
-                desired_subnet(rsp, reference.ref(vpc.status.atProvider.id))
-                return rsp
-
-        guard = runtime.ReferenceGuard(wrapped=Forgetful())
-        rsp = asyncio.run(guard.RunFunction(fnv1.RunFunctionRequest(), None))
-
-        self.assertEqual(len(rsp.results), 1)
-        self.assertEqual(rsp.results[0].severity, fnv1.SEVERITY_FATAL)
-        self.assertIn("reference.resolve", rsp.results[0].message)
-
-    def test_runtime_passes_a_resolved_response(self) -> None:
-        class Careful:
-            async def RunFunction(self, req, _context):  # noqa: N802
-                rsp = response.to(req)
-                vpc = reference.named("vpc", VPC)
-                desired_subnet(rsp, reference.ref(vpc.status.atProvider.id))
-                reference.resolve(req, rsp)
-                return rsp
-
-        guard = runtime.ReferenceGuard(wrapped=Careful())
-        req = fnv1.RunFunctionRequest(meta=ORDERED, observed=observed(vpc=VPC_OBSERVED))
-        rsp = asyncio.run(guard.RunFunction(req, None))
-
-        self.assertEqual(len(rsp.results), 0)
 
 
 class DnsForProvider(pydantic.BaseModel):
@@ -734,6 +441,148 @@ class TestComposing(unittest.TestCase):
             ],
         )
 
+    def test_external_name(self) -> None:
+        req = fnv1.RunFunctionRequest(meta=ORDERED, observed=observed(vpc=VPC_OBSERVED))
+        with reference.composing(req, response.to(req), "subnet") as c:
+            self.assertEqual(c.external_name(reference.named("vpc")), "vpc-0123")
+
+    def test_external_name_falls_back_to_name(self) -> None:
+        req = fnv1.RunFunctionRequest(
+            meta=ORDERED, observed=observed(vpc={"metadata": {"name": "xr-vpc-abc12"}})
+        )
+        with reference.composing(req, response.to(req), "subnet") as c:
+            self.assertEqual(c.external_name(reference.named("vpc")), "xr-vpc-abc12")
+
+    def test_missing_field_on_existing_source_is_none(self) -> None:
+        req = fnv1.RunFunctionRequest(
+            meta=ORDERED, observed=observed(vpc={"metadata": {"name": "xr-vpc-abc12"}})
+        )
+        rsp = response.to(req)
+        with reference.composing(req, rsp, "subnet") as c:
+            vpc_id = c.ref(reference.named("vpc", VPC).status.atProvider.id)
+            desired_subnet(rsp, vpc_id)
+
+        self.assertIsNone(vpc_id)
+        self.assertNotIn("vpcId", body(rsp, "subnet")["spec"]["forProvider"])
+
+    def test_none_is_stripped_however_the_resource_is_written(self) -> None:
+        req = fnv1.RunFunctionRequest(meta=ORDERED, observed=observed(vpc=VPC_OBSERVED))
+        rsp = response.to(req)
+        vpc = reference.named("vpc", VPC)
+        gone = reference.named("gone", VPC)
+
+        # resource.update rather than c.update, as a helper would call it. A
+        # model field set to None is emitted as a null, because it was set.
+        with reference.composing(req, rsp, "subnet") as c:
+            resource.update(
+                rsp.desired.resources["subnet"],
+                Subnet(
+                    spec=SubnetSpec(
+                        forProvider=SubnetForProvider(
+                            region="us-east-1", vpcId=c.ref(gone.status.atProvider.id)
+                        )
+                    )
+                ),
+            )
+
+        # A dict can carry None nested, and in a list.
+        with reference.composing(req, rsp, "tags") as c:
+            resource.update(
+                rsp.desired.resources["tags"],
+                {
+                    "spec": {
+                        "vpcId": c.ref(gone.status.atProvider.id),
+                        "tags": [
+                            "static",
+                            c.ref(vpc.status.atProvider.arn),
+                            c.ref(gone.status.atProvider.arn),
+                        ],
+                    }
+                },
+            )
+
+        self.assertEqual(
+            body(rsp, "subnet")["spec"]["forProvider"], {"region": "us-east-1"}
+        )
+        self.assertEqual(
+            body(rsp, "tags")["spec"], {"tags": ["static", "arn:aws:ec2:vpc/vpc-0123"]}
+        )
+
+    def test_does_not_duplicate_declared_dependencies(self) -> None:
+        req = fnv1.RunFunctionRequest(meta=ORDERED, observed=observed(vpc=VPC_OBSERVED))
+        rsp = response.to(req)
+        response.add_dependency(rsp, "subnet", "vpc")
+        vpc = reference.named("vpc", VPC)
+
+        with reference.composing(req, rsp, "subnet") as c:
+            c.update(
+                {
+                    "a": c.ref(vpc.status.atProvider.id),
+                    "b": c.ref(vpc.status.atProvider.arn),
+                }
+            )
+
+        self.assertEqual(
+            edges(rsp), [{"resource": "subnet", "composed_resource": "vpc"}]
+        )
+
+    def test_self_reference_declares_nothing(self) -> None:
+        req = fnv1.RunFunctionRequest(meta=ORDERED, observed=observed(vpc=VPC_OBSERVED))
+        rsp = response.to(req)
+        vpc = reference.named("vpc", VPC)
+
+        with reference.composing(req, rsp, "vpc") as c:
+            c.update({"tag": c.ref(vpc.status.atProvider.id)})
+
+        self.assertEqual(edges(rsp), [])
+
+    def required(self, *items: dict) -> fnv1.RunFunctionRequest:
+        return fnv1.RunFunctionRequest(
+            meta=ORDERED,
+            required_resources={
+                "dbs": fnv1.Resources(
+                    items=[
+                        fnv1.Resource(resource=resource.dict_to_struct(i))
+                        for i in items
+                    ]
+                )
+            },
+        )
+
+    def test_required_named_match(self) -> None:
+        req = self.required(
+            {
+                "metadata": {"name": "a", "namespace": "x"},
+                "status": {"address": "db.xa"},
+            },
+            {
+                "metadata": {"name": "a", "namespace": "y"},
+                "status": {"address": "db.ya"},
+            },
+        )
+        rsp = response.to(req)
+        db = reference.named_required("dbs", name="a", namespace="y")
+
+        with reference.composing(req, rsp, "app-config") as c:
+            host = c.ref(db.status.address)
+            c.update(
+                {"apiVersion": "v1", "kind": "ConfigMap", "data": {"DB_HOST": host}}
+            )
+
+        self.assertEqual(host, "db.ya")
+        self.assertEqual(
+            edges(rsp)[0]["required_resource"],
+            {"requirement_name": "dbs", "name": "a", "namespace": "y"},
+        )
+
+    def test_required_declines_to_guess_between_matches(self) -> None:
+        req = self.required(
+            {"metadata": {"name": "a"}, "status": {"address": "db.a"}},
+            {"metadata": {"name": "b"}, "status": {"address": "db.b"}},
+        )
+        with reference.composing(req, response.to(req), "app-config") as c:
+            self.assertIsNone(c.ref(reference.named_required("dbs").status.address))
+
     def test_rejects_values(self) -> None:
         req = fnv1.RunFunctionRequest(meta=ORDERED)
         rsp = response.to(req)
@@ -742,39 +591,6 @@ class TestComposing(unittest.TestCase):
             reference.composing(req, rsp, "subnet") as c,
         ):
             c.ref("vpc-0123")
-
-
-class TestBothStylesAgree(unittest.TestCase):
-    """The two styles are two ways to write the same thing."""
-
-    def setUp(self) -> None:
-        logging.configure(level=logging.Level.DISABLED)
-
-    def test_same_result(self) -> None:
-        for observed_state in (observed(vpc=VPC_OBSERVED), fnv1.State()):
-            with self.subTest(vpc_exists=bool(observed_state.resources)):
-                req = fnv1.RunFunctionRequest(meta=ORDERED, observed=observed_state)
-                vpc = reference.named("vpc", VPC)
-
-                marked = response.to(req)
-                desired_subnet(marked, reference.ref(vpc.status.atProvider.id))
-                reference.resolve(req, marked)
-
-                scoped = response.to(req)
-                with reference.composing(req, scoped, "subnet") as c:
-                    c.update(
-                        Subnet(
-                            spec=SubnetSpec(
-                                forProvider=SubnetForProvider(
-                                    region="us-east-1",
-                                    vpcId=c.ref(vpc.status.atProvider.id),
-                                )
-                            )
-                        )
-                    )
-
-                self.assertEqual(body(marked, "subnet"), body(scoped, "subnet"))
-                self.assertEqual(edges(marked), edges(scoped))
 
 
 if __name__ == "__main__":
